@@ -170,6 +170,8 @@ app.get('/', (req, res) => {
             'GET /api/media/debug': 'Debug endpoint for all media files',
             'GET /api/job-listings': 'Get active job listings',
             'POST /api/job-application': 'Submit job application with resume',
+            'GET /api/nav-categories': 'Get navigation categories',
+            'GET /api/nav-items': 'Get navigation items',
             'POST /api/lapsec-pricing': 'Submit Lapsec pricing inquiry',
             'POST /api/product-pricing': 'Submit general product pricing inquiry',
             'POST /api/subscribe-email': 'Subscribe to email newsletter',
@@ -181,6 +183,7 @@ app.get('/', (req, res) => {
             'Management Team API',
             'Media Library API',
             'Job Applications',
+            'Navigation Management',
             'Product Pricing',
             'Email Subscriptions',
             'Static File Serving'
@@ -398,6 +401,81 @@ app.get('/api/job-listings', async (req, res) => {
     }
 });
 
+// Navigation categories
+app.get('/api/nav-categories', async (req, res) => {
+    let connection;
+    
+    try {
+        connection = await dbPool.getConnection();
+        
+        // Create table if not exists
+        await connection.execute(`
+            CREATE TABLE IF NOT EXISTS nav_categories (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                display_order INT DEFAULT 0,
+                status ENUM('A', 'I') DEFAULT 'A',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        
+        const [rows] = await connection.execute('SELECT * FROM nav_categories ORDER BY display_order ASC');
+        
+        res.json({
+            success: true,
+            categories: rows
+        });
+        
+    } catch (error) {
+        console.error('Navigation categories error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Database error occurred'
+        });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Navigation items
+app.get('/api/nav-items', async (req, res) => {
+    let connection;
+    
+    try {
+        connection = await dbPool.getConnection();
+        
+        // Create table if not exists
+        await connection.execute(`
+            CREATE TABLE IF NOT EXISTS nav_items (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                category_id INT,
+                name VARCHAR(100) NOT NULL,
+                url VARCHAR(255) NOT NULL,
+                display_order INT DEFAULT 0,
+                status ENUM('A', 'I') DEFAULT 'A',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (category_id) REFERENCES nav_categories(id) ON DELETE SET NULL
+            )
+        `);
+        
+        const [rows] = await connection.execute('SELECT * FROM nav_items WHERE status = "A" ORDER BY category_id ASC, display_order ASC');
+        
+        res.json({
+            success: true,
+            items: rows
+        });
+        
+    } catch (error) {
+        console.error('Navigation items error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Database error occurred'
+        });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
 // Job application submission
 app.post('/api/job-application', upload.single('resume'), async (req, res) => {
     let connection;
@@ -465,30 +543,144 @@ app.post('/api/job-application', upload.single('resume'), async (req, res) => {
         }
         
         // Send notification emails
+        const adminSubject = `New Job Application Received - ${jobTitle || 'General Application'}`;
         const adminHtml = `
-            <h2>New Job Application Received</h2>
-            <p><strong>Application ID:</strong> ${appId}</p>
-            <p><strong>Job Title:</strong> ${jobTitle || 'General Application'}</p>
-            <p><strong>Applicant Name:</strong> ${firstName} ${lastName}</p>
-            <p><strong>Email:</strong> ${email}</p>
-            <p><strong>Phone:</strong> ${phone}</p>
-            <p><strong>Resume:</strong> <a href="${s3Url}">Download Resume</a></p>
-            <p><strong>Submitted Date:</strong> ${new Date().toLocaleString()}</p>
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #3570f7; border-bottom: 2px solid #3570f7; padding-bottom: 10px;">
+                    New Job Application Received
+                </h2>
+                <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                    <h3 style="margin-top: 0; color: #222;">Application Details</h3>
+                    <p><strong>Application ID:</strong> ${appId}</p>
+                    <p><strong>Job Title:</strong> ${jobTitle || 'General Application'}</p>
+                    <p><strong>Applicant Name:</strong> ${firstName} ${lastName}</p>
+                    <p><strong>Email:</strong> ${email}</p>
+                    <p><strong>Phone:</strong> ${phone}</p>
+                    <p><strong>Resume:</strong> <a href="${s3Url}" style="color: #3570f7;">Download Resume</a></p>
+                    <p><strong>Submitted Date:</strong> ${new Date().toLocaleString()}</p>
+                </div>
+                <p style="background: #e3f2fd; padding: 15px; border-radius: 5px; border-left: 4px solid #2196f3;">
+                    <strong>Action Required:</strong> Please review this application and respond to the candidate as soon as possible.
+                </p>
+                <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; font-size: 12px; color: #666;">
+                    <p>This is an automated notification from the Vardaan Data Sciences job application system.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        `;
+        const adminText = `
+A new job application has been received:
+
+Application ID: ${appId}
+Job Title: ${jobTitle || 'General Application'}
+Applicant Name: ${firstName} ${lastName}
+Email: ${email}
+Phone: ${phone}
+Resume: ${s3Url}
+Date: ${new Date().toLocaleString()}
+
+Please review this application and respond to the candidate as soon as possible.
         `;
         
-        await sendHtmlEmail(EMAIL_RECEIVER, `New Job Application Received - ${jobTitle || 'General Application'}`, adminHtml);
+        await sendHtmlEmail(EMAIL_RECEIVER, adminSubject, adminHtml, adminText);
         
+        // Send confirmation email to applicant
+        const applicantSubject = 'Thank You for Your Job Application - Vardaan Data Sciences';
         const applicantHtml = `
-            <h1>Thank You!</h1>
-            <p>Your application has been successfully submitted</p>
-            <p><strong>Application ID:</strong> ${appId}</p>
-            <p><strong>Job Title:</strong> ${jobTitle || 'General Application'}</p>
-            <p><strong>Submitted Date:</strong> ${new Date().toLocaleString()}</p>
-            <p>Our HR team will review your application within 2-3 business days.</p>
-            <p>Best regards,<br>The Vardaan Data Sciences Team</p>
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="text-align: center; margin-bottom: 30px;">
+                    <h1 style="color: #3570f7; margin-bottom: 10px;">Thank You!</h1>
+                    <p style="font-size: 18px; color: #666;">Your application has been successfully submitted</p>
+                </div>
+                
+                <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                    <h3 style="margin-top: 0; color: #222;">Application Details</h3>
+                    <p><strong>Application ID:</strong> ${appId}</p>
+                    <p><strong>Job Title:</strong> ${jobTitle || 'General Application'}</p>
+                    <p><strong>Submitted Date:</strong> ${new Date().toLocaleString()}</p>
+                    <p><strong>Resume:</strong> <a href="${s3Url}" style="color: #3570f7;">Access Your Resume</a></p>
+                </div>
+                
+                <div style="background: #e8f5e8; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                    <h3 style="margin-top: 0; color: #2e7d32;">What happens next?</h3>
+                    <ol style="margin: 0; padding-left: 20px;">
+                        <li>Our HR team will review your application within 2-3 business days</li>
+                        <li>If your profile matches our requirements, we will contact you for the next steps</li>
+                        <li>You may be invited for an initial screening call or technical assessment</li>
+                        <li>We will keep you updated throughout the process</li>
+                    </ol>
+                </div>
+                
+                <div style="background: #fff3cd; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                    <h3 style="margin-top: 0; color: #856404;">Important Notes</h3>
+                    <ul style="margin: 0; padding-left: 20px;">
+                        <li>Please ensure your contact information (email and phone) is current</li>
+                        <li>You can access your resume anytime using the link provided above</li>
+                        <li>If you have any questions, please reply to this email or contact us at info@vardaanglobal.com</li>
+                    </ul>
+                </div>
+                
+                <p style="text-align: center; margin-top: 30px; font-style: italic; color: #666;">
+                    We're excited about the possibility of having you join our team and contribute to our mission of transforming businesses through data-driven insights.
+                </p>
+                
+                <div style="margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 8px; text-align: center;">
+                    <p style="margin: 0; font-weight: bold;">Best regards,</p>
+                    <p style="margin: 5px 0;">The Vardaan Data Sciences Team</p>
+                </div>
+                
+                <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; font-size: 12px; color: #666; text-align: center;">
+                    <p style="margin: 5px 0;"><strong>Vardaan Data Sciences Pvt Ltd</strong></p>
+                    <p style="margin: 5px 0;">Aurum, 1st Floor, Plot No 57, Jayabheri Enclave</p>
+                    <p style="margin: 5px 0;">Gachibowli Hyderabad-500032 INDIA</p>
+                    <p style="margin: 5px 0;">Phone: +91 40-35171118, +91 40-35171119</p>
+                    <p style="margin: 5px 0;">Email: info@vardaanglobal.com</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        `;
+        const applicantText = `
+Dear ${firstName} ${lastName},
+
+Thank you for submitting your job application to Vardaan Data Sciences! We have successfully received your application and appreciate your interest in joining our team.
+
+Application Details:
+Application ID: ${appId}
+Job Title: ${jobTitle || 'General Application'}
+Submitted Date: ${new Date().toLocaleString()}
+Resume: ${s3Url}
+
+What happens next:
+1. Our HR team will review your application within 2-3 business days
+2. If your profile matches our requirements, we will contact you for the next steps
+3. You may be invited for an initial screening call or technical assessment
+4. We will keep you updated throughout the process
+
+Important Notes:
+• Please ensure your contact information (email and phone) is current
+• You can access your resume anytime using the link provided above
+• If you have any questions, please reply to this email or contact us at info@vardaanglobal.com
+
+We're excited about the possibility of having you join our team and contribute to our mission of transforming businesses through data-driven insights.
+
+Best regards,
+The Vardaan Data Sciences Team
+
+---
+Vardaan Data Sciences Pvt Ltd
+Aurum, 1st Floor, Plot No 57, Jayabheri Enclave
+Gachibowli Hyderabad-500032 INDIA
+Phone: +91 40-35171118, +91 40-35171119
+Email: info@vardaanglobal.com
         `;
         
-        await sendHtmlEmail(email, 'Thank You for Your Job Application - Vardaan Data Sciences', applicantHtml);
+        await sendHtmlEmail(email, applicantSubject, applicantHtml, applicantText);
         
         res.status(201).json({
             success: true,
@@ -796,6 +988,9 @@ app.get('*', (req, res) => {
             '/api/management-team',
             '/api/media',
             '/api/job-listings',
+            '/api/job-application',
+            '/api/nav-categories',
+            '/api/nav-items',
             '/api/lapsec-pricing',
             '/api/product-pricing',
             '/api/subscribe-email',
