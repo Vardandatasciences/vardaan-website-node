@@ -4,6 +4,7 @@ const path = require('path');
 const mysql = require('mysql2/promise');
 const mime = require('mime-types');
 const { v4: uuidv4 } = require('uuid');
+const FormData = require('form-data');
 
 class RenderS3Client {
     constructor(apiBaseUrl = "https://aws-microservice.onrender.com", mysqlConfig = null) {
@@ -20,16 +21,16 @@ class RenderS3Client {
     _setupDefaultMySQL() {
         try {
             const mysqlConfig = {
-                host: 'vardaanwebsites.c1womgmu83di.ap-south-1.rds.amazonaws.com',
-                user: 'admin',
-                password: 'vardaanwebservices',
-                database: 'vardaan_ds',
-                port: 3306,
+                host: process.env.DB_HOST || 'vardaanwebsites.c1womgmu83di.ap-south-1.rds.amazonaws.com',
+                user: process.env.DB_USER || 'admin',
+                password: process.env.DB_PASSWORD || 'vardaanwebservices',
+                database: process.env.DB_NAME || 'vardaan_ds',
+                port: parseInt(process.env.DB_PORT) || 3306,
                 charset: 'utf8mb4'
             };
             this._setupMySQLDatabase(mysqlConfig);
         } catch (error) {
-            console.error('MySQL setup with RDS failed:', error);
+            console.error('MySQL setup with defaults failed:', error);
             this.dbPool = null;
         }
     }
@@ -39,8 +40,11 @@ class RenderS3Client {
             this.dbPool = mysql.createPool({
                 ...mysqlConfig,
                 waitForConnections: true,
-                connectionLimit: 5,
-                queueLimit: 0
+                connectionLimit: 10,
+                queueLimit: 0,
+                acquireTimeout: 60000,
+                timeout: 60000,
+                reconnect: true
             });
             
             console.log("✅ MySQL connection pool initialized successfully");
@@ -99,10 +103,13 @@ class RenderS3Client {
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     original_name VARCHAR(500) NOT NULL,
                     s3_url TEXT NOT NULL,
-                    file_type ENUM('image', 'video') NOT NULL,
+                    file_type ENUM('image', 'video', 'document') NOT NULL,
                     category VARCHAR(100) NOT NULL,
                     uploaded_by VARCHAR(255) NOT NULL,
                     uploaded_at TIMESTAMP NOT NULL,
+                    file_size BIGINT,
+                    content_type VARCHAR(255),
+                    s3_key VARCHAR(1000),
                     
                     INDEX idx_category (category),
                     INDEX idx_file_type (file_type),
@@ -278,7 +285,7 @@ class RenderS3Client {
         return result;
     }
     
-    async upload(filePath, userId = "default-user", customFileName = null) {
+    async upload(filePath, userId = "default-user", customFileName = null, category = "uploads") {
         let operationId = null;
         
         try {
@@ -290,6 +297,7 @@ class RenderS3Client {
             const fileName = customFileName || path.basename(filePath);
             const stats = await fs.stat(filePath);
             const fileSize = stats.size;
+            const contentType = mime.lookup(filePath) || 'application/octet-stream';
             
             console.log(`📤 Uploading ${fileName} (${fileSize} bytes) via Render...`);
             
@@ -300,12 +308,13 @@ class RenderS3Client {
                 original_name: path.basename(filePath),
                 file_type: path.extname(fileName).slice(1).toLowerCase() || '',
                 file_size: fileSize,
-                content_type: mime.lookup(filePath) || 'application/octet-stream',
+                content_type: contentType,
                 status: 'pending',
                 metadata: {
                     original_path: filePath,
                     platform: 'Render',
-                    render_url: this.apiBaseUrl
+                    render_url: this.apiBaseUrl,
+                    category: category
                 }
             };
             
@@ -316,14 +325,18 @@ class RenderS3Client {
             const fileBuffer = await fs.readFile(filePath);
             
             const formData = new FormData();
-            const blob = new Blob([fileBuffer], { type: operationData.content_type });
-            formData.append('file', blob, fileName);
+            formData.append('file', fileBuffer, {
+                filename: fileName,
+                contentType: contentType
+            });
             
             const response = await axios.post(url, formData, {
                 timeout: 300000,
                 headers: {
-                    'Content-Type': 'multipart/form-data'
-                }
+                    ...formData.getHeaders()
+                },
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity
             });
             
             const result = response.data;
@@ -343,10 +356,25 @@ class RenderS3Client {
                             original_path: filePath,
                             platform: 'Render',
                             render_url: this.apiBaseUrl,
+                            category: category,
                             upload_response: fileInfo
                         }
                     };
                     await this._updateOperationRecord(operationId, updateData);
+                }
+                
+                // Save to media library if it's a media file
+                if (this._isMediaFile(fileName)) {
+                    await this._saveToMediaLibrary({
+                        original_name: fileName,
+                        s3_url: fileInfo.url,
+                        file_type: this._getMediaType(contentType),
+                        category: category,
+                        uploaded_by: userId,
+                        file_size: fileSize,
+                        content_type: contentType,
+                        s3_key: fileInfo.s3Key
+                    });
                 }
                 
                 console.log(`✅ Upload successful! File: ${fileInfo.storedName}`);
@@ -514,7 +542,7 @@ class RenderS3Client {
             const payload = { data: data };
             
             const response = await axios.post(url, payload, { timeout: 300000 });
-            const result = response.data;
+            const result = response.json ? await response.json() : response.data;
             
             if (result.success) {
                 const exportInfo = result.export;
@@ -664,6 +692,83 @@ class RenderS3Client {
             if (connection) connection.release();
         }
     }
+    
+    async _saveToMediaLibrary(mediaData) {
+        if (!this.dbPool) return;
+        
+        let connection;
+        try {
+            connection = await this.dbPool.getConnection();
+            
+            const query = `
+                INSERT INTO media_library
+                (original_name, s3_url, file_type, category, uploaded_by, uploaded_at, file_size, content_type, s3_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `;
+            
+            const params = [
+                mediaData.original_name,
+                mediaData.s3_url,
+                mediaData.file_type,
+                mediaData.category,
+                mediaData.uploaded_by,
+                new Date(),
+                mediaData.file_size,
+                mediaData.content_type,
+                mediaData.s3_key
+            ];
+            
+            await connection.execute(query, params);
+            console.log(`📸 Media file saved to library: ${mediaData.original_name}`);
+        } catch (error) {
+            console.error("❌ Media library save error:", error);
+        } finally {
+            if (connection) connection.release();
+        }
+    }
+    
+    _isMediaFile(fileName) {
+        const mediaExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm'];
+        const ext = path.extname(fileName).toLowerCase();
+        return mediaExtensions.includes(ext);
+    }
+    
+    _getMediaType(contentType) {
+        if (contentType.startsWith('image/')) return 'image';
+        if (contentType.startsWith('video/')) return 'video';
+        return 'document';
+    }
+    
+    async quickTest() {
+        console.log("🚀 Quick Test: Render S3 Client with MySQL");
+        console.log("=" * 60);
+        
+        // Test connections
+        const result = await this.testConnection();
+        
+        if (result.overall_success) {
+            console.log("✅ All systems operational!");
+            
+            // Show operation stats
+            const stats = await this.getOperationStats();
+            if (stats && Object.keys(stats).length > 0) {
+                console.log("\n📊 Database Stats:");
+                console.log(`   Total operations: ${stats.total_operations || 0}`);
+                console.log(`   Completed: ${stats.total_completed || 0}`);
+                console.log(`   Failed: ${stats.total_failed || 0}`);
+            }
+        } else {
+            console.log("❌ Some systems need attention");
+            if (result.render_status !== 'connected') {
+                console.log(`   Render: ${result.render_error || 'Unknown error'}`);
+            }
+            if (result.mysql_status !== 'connected') {
+                console.log(`   MySQL: ${result.mysql_error || 'Unknown error'}`);
+            }
+        }
+        
+        return result;
+    }
 }
 
 // Helper function to create client
@@ -671,9 +776,9 @@ function createRenderMySQLClient(mysqlConfig = null) {
     try {
         if (!mysqlConfig) {
             mysqlConfig = {
-                host: process.env.DB_HOST || 'localhost',
-                user: process.env.DB_USER || 'root',
-                password: process.env.DB_PASSWORD || 'root',
+                host: process.env.DB_HOST || 'vardaanwebsites.c1womgmu83di.ap-south-1.rds.amazonaws.com',
+                user: process.env.DB_USER || 'admin',
+                password: process.env.DB_PASSWORD || 'vardaanwebservices',
                 database: process.env.DB_NAME || 'vardaan_ds',
                 port: parseInt(process.env.DB_PORT) || 3306
             };
@@ -697,7 +802,93 @@ function createRenderMySQLClient(mysqlConfig = null) {
     }
 }
 
+// Example usage function
+async function main() {
+    console.log("🚀 Render S3 Microservice Client with MySQL");
+    console.log("🌐 Render URL: https://aws-microservice.onrender.com");
+    console.log("🗄️  Database: MySQL");
+    console.log("=" * 60);
+    
+    // Create client
+    const client = createRenderMySQLClient();
+    
+    // Test connections
+    console.log("1. Testing connections...");
+    const result = await client.testConnection();
+    
+    if (!result.overall_success) {
+        console.log("❌ Cannot proceed - fix connection issues first");
+        return;
+    }
+    
+    // Example operations
+    const sampleData = [
+        {"id": 1, "name": "MySQL Test", "platform": "Render", "status": "active"},
+        {"id": 2, "name": "S3 Integration", "platform": "AWS", "status": "deployed"},
+        {"id": 3, "name": "Database Tracking", "platform": "MySQL", "status": "operational"}
+    ];
+    
+    console.log("\n2. Testing export functionality...");
+    const exportResult = await client.export(sampleData, 'json', 'mysql_render_test.json', 'test_user');
+    
+    if (exportResult.success) {
+        console.log("✅ Export successful!");
+        console.log(`   Operation ID: ${exportResult.operation_id}`);
+        console.log(`   File: ${exportResult.export_info.storedName}`);
+        console.log(`   URL: ${exportResult.export_info.url}`);
+        
+        // Test download
+        console.log("\n3. Testing download functionality...");
+        const s3Key = exportResult.export_info.s3Key;
+        const fileName = exportResult.export_info.storedName;
+        
+        const downloadResult = await client.download(s3Key, fileName, './downloads', 'test_user');
+        
+        if (downloadResult.success) {
+            console.log("✅ Download successful!");
+            console.log(`   Operation ID: ${downloadResult.operation_id}`);
+            console.log(`   File saved: ${downloadResult.file_path}`);
+        } else {
+            console.log(`❌ Download failed: ${downloadResult.error}`);
+        }
+    } else {
+        console.log(`❌ Export failed: ${exportResult.error}`);
+    }
+    
+    // Show operation history
+    console.log("\n4. Operation history from MySQL:");
+    const history = await client.getOperationHistory('test_user', 5);
+    
+    if (history.length > 0) {
+        history.forEach((op, i) => {
+            console.log(`   ${i + 1}. ${op.operation_type} - ${op.file_name} - ${op.status} (${op.created_at})`);
+        });
+    } else {
+        console.log("   No operations found in database");
+    }
+    
+    // Show statistics
+    console.log("\n5. Database statistics:");
+    const stats = await client.getOperationStats();
+    
+    if (stats && Object.keys(stats).length > 0) {
+        console.log(`   Total operations: ${stats.total_operations || 0}`);
+        console.log(`   Completed: ${stats.total_completed || 0}`);
+        console.log(`   Failed: ${stats.total_failed || 0}`);
+        
+        if (stats.operations_by_type && stats.operations_by_type.length > 0) {
+            console.log("   Operations by type:");
+            stats.operations_by_type.forEach(opStat => {
+                console.log(`     - ${opStat.operation_type}: ${opStat.total_count} total`);
+            });
+        }
+    }
+    
+    console.log("\n🎉 Render + MySQL integration test completed!");
+}
+
 module.exports = {
     RenderS3Client,
-    createRenderMySQLClient
+    createRenderMySQLClient,
+    main
 }; 
