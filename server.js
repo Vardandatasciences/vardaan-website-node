@@ -85,10 +85,35 @@ const EMAIL_RECEIVER = process.env.EMAIL_RECEIVER || 'vinnurudroju28@gmail.com';
 // Initialize S3 client
 let s3Client;
 try {
+    console.log("🔧 Initializing S3 client...");
+    console.log("  Render URL: https://aws-microservice.onrender.com");
+    console.log("  Database config:", {
+        host: DB_CONFIG.host,
+        user: DB_CONFIG.user,
+        database: DB_CONFIG.database,
+        port: DB_CONFIG.port
+    });
+    
     s3Client = new RenderS3Client("https://aws-microservice.onrender.com", DB_CONFIG);
-    console.log("✅ S3 client initialized");
+    console.log("✅ S3 client initialized successfully");
+    
+    // Test the client immediately
+    s3Client.testConnection().then(result => {
+        if (result.overall_success) {
+            console.log("✅ S3 client connection test passed");
+        } else {
+            console.log("⚠️  S3 client connection test issues:");
+            if (result.render_error) console.log("  Render:", result.render_error);
+            if (result.mysql_error) console.log("  MySQL:", result.mysql_error);
+        }
+    }).catch(error => {
+        console.error("❌ S3 client connection test failed:", error.message);
+    });
+    
 } catch (error) {
-    console.error("❌ S3 client initialization failed:", error);
+    console.error("❌ S3 client initialization failed:", error.message);
+    console.error("❌ Stack trace:", error.stack);
+    s3Client = null;
 }
 
 // Utility functions
@@ -176,7 +201,10 @@ app.get('/', (req, res) => {
             'POST /api/lapsec-pricing': 'Submit Lapsec pricing inquiry',
             'POST /api/product-pricing': 'Submit general product pricing inquiry',
             'POST /api/subscribe-email': 'Subscribe to email newsletter',
-            'GET /api/get-currency': 'Get currency based on IP'
+            'GET /api/get-currency': 'Get currency based on IP',
+            'GET /api/s3-operations': 'Get S3 file operations history',
+            'GET /api/s3-stats': 'Get S3 operations statistics',
+            'GET /api/s3-test': 'Test S3 connection and health'
         },
         status: 'running',
         integrated_services: [
@@ -229,6 +257,88 @@ app.get('/api/health', async (req, res) => {
 app.get('/api/get-currency', getCurrency);
 app.post('/api/lapsec-pricing', submitLapsecPricing);
 app.post('/api/product-pricing', submitProductPricing);
+
+// S3 Operations tracking endpoints
+app.get('/api/s3-operations', async (req, res) => {
+    try {
+        const { user_id, limit = 20 } = req.query;
+        
+        if (!s3Client) {
+            return res.status(503).json({
+                success: false,
+                message: 'S3 client not available'
+            });
+        }
+        
+        const history = await s3Client.getOperationHistory(user_id, parseInt(limit));
+        
+        res.json({
+            success: true,
+            operations: history,
+            count: history.length
+        });
+        
+    } catch (error) {
+        console.error('S3 operations history error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch operations history',
+            error: error.message
+        });
+    }
+});
+
+app.get('/api/s3-stats', async (req, res) => {
+    try {
+        if (!s3Client) {
+            return res.status(503).json({
+                success: false,
+                message: 'S3 client not available'
+            });
+        }
+        
+        const stats = await s3Client.getOperationStats();
+        
+        res.json({
+            success: true,
+            stats: stats
+        });
+        
+    } catch (error) {
+        console.error('S3 stats error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch S3 statistics',
+            error: error.message
+        });
+    }
+});
+
+app.get('/api/s3-test', async (req, res) => {
+    try {
+        if (!s3Client) {
+            return res.status(503).json({
+                success: false,
+                message: 'S3 client not initialized'
+            });
+        }
+        
+        const testResult = await s3Client.testConnection();
+        
+        res.json({
+            success: testResult.overall_success,
+            test_results: testResult
+        });
+        
+    } catch (error) {
+        console.error('S3 test error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'S3 test failed',
+            error: error.message
+        });
+    }
+});
 
 // Contact form submission
 app.post('/api/contact', async (req, res) => {
@@ -498,18 +608,61 @@ app.post('/api/job-application', upload.single('resume'), async (req, res) => {
             });
         }
         
-        // Upload resume to S3
-        const uploadResult = await s3Client.upload(req.file.path, email, req.file.originalname);
+        // Validate file type (optional but recommended)
+        const allowedExtensions = ['.pdf', '.doc', '.docx'];
+        const fileExtension = path.extname(req.file.originalname).toLowerCase();
+        if (!allowedExtensions.includes(fileExtension)) {
+            // Clean up uploaded file
+            try {
+                await fs.remove(req.file.path);
+            } catch (cleanupError) {
+                console.warn('Failed to cleanup invalid file:', cleanupError);
+            }
+            
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid file type. Only PDF, DOC, and DOCX files are allowed.'
+            });
+        }
+        
+        console.log(`📤 Processing job application for ${firstName} ${lastName} - ${email}`);
+        console.log(`📄 Resume: ${req.file.originalname} (${req.file.size} bytes)`);
+        
+        // Check if S3 client is available
+        if (!s3Client) {
+            throw new Error('S3 client not initialized. Please check server startup logs.');
+        }
+        
+        console.log('🌐 S3 client available, starting upload...');
+        
+        // Upload resume to S3 with category for better organization
+        const uploadResult = await s3Client.upload(
+            req.file.path, 
+            email, 
+            req.file.originalname, 
+            'job-applications'
+        );
         
         if (!uploadResult.success) {
+            // Clean up uploaded file on failure
+            try {
+                await fs.remove(req.file.path);
+            } catch (cleanupError) {
+                console.warn('Failed to cleanup temp file after upload failure:', cleanupError);
+            }
+            
             return res.status(500).json({
                 success: false,
                 message: 'Failed to upload resume to S3',
-                error: uploadResult.error
+                error: uploadResult.error,
+                operation_id: uploadResult.operation_id
             });
         }
         
         const s3Url = uploadResult.file_info.url;
+        const s3Key = uploadResult.file_info.s3Key;
+        
+        console.log(`✅ Resume uploaded to S3: ${s3Url}`);
         
         // Save to database
         connection = await dbPool.getConnection();
@@ -524,17 +677,27 @@ app.post('/api/job-application', upload.single('resume'), async (req, res) => {
                 email VARCHAR(255) NOT NULL,
                 phone_number VARCHAR(20) NOT NULL,
                 resume_file_path TEXT NOT NULL,
+                resume_s3_key VARCHAR(1000),
+                resume_original_name VARCHAR(500),
+                file_size BIGINT,
+                s3_operation_id INT,
                 submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status ENUM('pending', 'reviewed', 'shortlisted', 'rejected') DEFAULT 'pending'
+                status ENUM('pending', 'reviewed', 'shortlisted', 'rejected') DEFAULT 'pending',
+                
+                INDEX idx_email (email),
+                INDEX idx_status (status),
+                INDEX idx_submitted_at (submitted_at)
             )
         `);
         
         const [result] = await connection.execute(
-            'INSERT INTO job_applications (job_title, first_name, last_name, email, phone_number, resume_file_path) VALUES (?, ?, ?, ?, ?, ?)',
-            [jobTitle, firstName, lastName, email, phone, s3Url]
+            'INSERT INTO job_applications (job_title, first_name, last_name, email, phone_number, resume_file_path, resume_s3_key, resume_original_name, file_size, s3_operation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [jobTitle, firstName, lastName, email, phone, s3Url, s3Key, req.file.originalname, req.file.size, uploadResult.operation_id]
         );
         
         const appId = result.insertId;
+        
+        console.log(`💾 Job application saved to database with ID: ${appId}`);
         
         // Clean up uploaded file
         try {
@@ -555,18 +718,26 @@ app.post('/api/job-application', upload.single('resume'), async (req, res) => {
                 <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
                     <h3 style="margin-top: 0; color: #222;">Application Details</h3>
                     <p><strong>Application ID:</strong> ${appId}</p>
+                    <p><strong>S3 Operation ID:</strong> ${uploadResult.operation_id}</p>
                     <p><strong>Job Title:</strong> ${jobTitle || 'General Application'}</p>
                     <p><strong>Applicant Name:</strong> ${firstName} ${lastName}</p>
                     <p><strong>Email:</strong> ${email}</p>
                     <p><strong>Phone:</strong> ${phone}</p>
-                    <p><strong>Resume:</strong> <a href="${s3Url}" style="color: #3570f7;">Download Resume</a></p>
+                    <p><strong>Resume File:</strong> ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)</p>
+                    <p><strong>Resume URL:</strong> <a href="${s3Url}" style="color: #3570f7;" target="_blank">Download Resume</a></p>
+                    <p><strong>S3 Key:</strong> <code style="background: #f1f1f1; padding: 2px 4px; border-radius: 3px;">${s3Key}</code></p>
                     <p><strong>Submitted Date:</strong> ${new Date().toLocaleString()}</p>
+                </div>
+                <div style="background: #e8f5e8; padding: 15px; border-radius: 5px; border-left: 4px solid #4caf50; margin: 20px 0;">
+                    <p style="margin: 0;"><strong>✅ File Upload Status:</strong> Successfully uploaded to S3 cloud storage</p>
+                    <p style="margin: 5px 0 0 0; font-size: 14px; color: #666;">Platform: ${uploadResult.platform} | Database: ${uploadResult.database}</p>
                 </div>
                 <p style="background: #e3f2fd; padding: 15px; border-radius: 5px; border-left: 4px solid #2196f3;">
                     <strong>Action Required:</strong> Please review this application and respond to the candidate as soon as possible.
                 </p>
                 <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; font-size: 12px; color: #666;">
                     <p>This is an automated notification from the Vardaan Data Sciences job application system.</p>
+                    <p>File stored securely in AWS S3 with full operation tracking.</p>
                 </div>
             </div>
         </body>
@@ -576,14 +747,22 @@ app.post('/api/job-application', upload.single('resume'), async (req, res) => {
 A new job application has been received:
 
 Application ID: ${appId}
+S3 Operation ID: ${uploadResult.operation_id}
 Job Title: ${jobTitle || 'General Application'}
 Applicant Name: ${firstName} ${lastName}
 Email: ${email}
 Phone: ${phone}
-Resume: ${s3Url}
+Resume File: ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)
+Resume URL: ${s3Url}
+S3 Key: ${s3Key}
 Date: ${new Date().toLocaleString()}
 
+File Upload Status: ✅ Successfully uploaded to S3 cloud storage
+Platform: ${uploadResult.platform} | Database: ${uploadResult.database}
+
 Please review this application and respond to the candidate as soon as possible.
+
+This file is stored securely in AWS S3 with full operation tracking.
         `;
         
         await sendHtmlEmail(EMAIL_RECEIVER, adminSubject, adminHtml, adminText);
@@ -603,8 +782,15 @@ Please review this application and respond to the candidate as soon as possible.
                     <h3 style="margin-top: 0; color: #222;">Application Details</h3>
                     <p><strong>Application ID:</strong> ${appId}</p>
                     <p><strong>Job Title:</strong> ${jobTitle || 'General Application'}</p>
+                    <p><strong>Resume File:</strong> ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)</p>
                     <p><strong>Submitted Date:</strong> ${new Date().toLocaleString()}</p>
-                    <p><strong>Resume:</strong> <a href="${s3Url}" style="color: #3570f7;">Access Your Resume</a></p>
+                    <p><strong>Resume Link:</strong> <a href="${s3Url}" style="color: #3570f7;" target="_blank">Access Your Resume</a></p>
+                </div>
+                
+                <div style="background: #e8f5e8; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                    <h3 style="margin-top: 0; color: #2e7d32;">✅ File Upload Confirmation</h3>
+                    <p style="margin: 0;">Your resume has been securely uploaded to our cloud storage system.</p>
+                    <p style="margin: 5px 0 0 0; font-size: 14px; color: #666;">Upload ID: ${uploadResult.operation_id} | Platform: ${uploadResult.platform}</p>
                 </div>
                 
                 <div style="background: #e8f5e8; padding: 20px; border-radius: 8px; margin: 20px 0;">
@@ -654,8 +840,13 @@ Thank you for submitting your job application to Vardaan Data Sciences! We have 
 Application Details:
 Application ID: ${appId}
 Job Title: ${jobTitle || 'General Application'}
+Resume File: ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)} KB)
 Submitted Date: ${new Date().toLocaleString()}
-Resume: ${s3Url}
+Resume Link: ${s3Url}
+
+✅ File Upload Confirmation:
+Your resume has been securely uploaded to our cloud storage system.
+Upload ID: ${uploadResult.operation_id} | Platform: ${uploadResult.platform}
 
 What happens next:
 1. Our HR team will review your application within 2-3 business days
@@ -686,15 +877,51 @@ Email: info@vardaanglobal.com
         res.status(201).json({
             success: true,
             message: 'Application submitted successfully',
-            application_id: appId
+            application_id: appId,
+            s3_operation_id: uploadResult.operation_id,
+            resume_url: s3Url,
+            resume_s3_key: s3Key,
+            file_info: {
+                original_name: req.file.originalname,
+                size: req.file.size,
+                stored_name: uploadResult.file_info.storedName
+            },
+            upload_platform: uploadResult.platform,
+            database_platform: uploadResult.database
         });
         
     } catch (error) {
-        console.error('Job application error:', error);
+        console.error('❌ Job application error details:');
+        console.error('  Error message:', error.message);
+        console.error('  Error stack:', error.stack);
+        console.error('  Request body:', req.body);
+        console.error('  File info:', req.file ? {
+            originalname: req.file.originalname,
+            size: req.file.size,
+            mimetype: req.file.mimetype,
+            path: req.file.path
+        } : 'No file');
+        
+        // Clean up uploaded file if it exists
+        if (req.file && req.file.path) {
+            try {
+                await fs.remove(req.file.path);
+                console.log('🧹 Cleaned up temp file after error');
+            } catch (cleanupError) {
+                console.warn('⚠️  Failed to cleanup temp file:', cleanupError.message);
+            }
+        }
+        
         res.status(500).json({
             success: false,
-            message: 'An error occurred',
-            error: error.message
+            message: 'Job application submission failed',
+            error: error.message,
+            details: {
+                step: 'Determining failure point...',
+                timestamp: new Date().toISOString(),
+                hasFile: !!req.file,
+                hasS3Client: !!s3Client
+            }
         });
     } finally {
         if (connection) connection.release();
