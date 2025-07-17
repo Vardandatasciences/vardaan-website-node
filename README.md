@@ -142,10 +142,27 @@ Node/
 
 ### Common Issues:
 
-1. **CORS Errors**: Update `FRONTEND_URL` in backend environment variables
-2. **Database Connection**: Check if RDS instance is accessible
-3. **Email Not Sending**: Verify Gmail app password is correct
-4. **File Uploads**: Ensure S3/Render service is running
+1. **502 Bad Gateway Error**: 
+   - ✅ **FIXED**: Removed static file serving that was causing issues
+   - ✅ **FIXED**: Updated server to be API-only
+   - ✅ **FIXED**: Added proper error handling
+   - Check Render logs for specific errors
+   - Ensure all environment variables are set
+
+2. **CORS Errors**: Update `FRONTEND_URL` in backend environment variables
+3. **Database Connection**: Check if RDS instance is accessible
+4. **Email Not Sending**: Verify Gmail app password is correct
+5. **File Uploads**: Ensure S3/Render service is running
+
+### Testing Your Deployment:
+
+```bash
+# Test your deployed backend
+curl https://your-backend-name.onrender.com/api/health
+
+# Or use the test script
+node test-server.js
+```
 
 ### Support
 

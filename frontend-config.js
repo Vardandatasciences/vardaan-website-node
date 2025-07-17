@@ -9,7 +9,7 @@ const DEV_CONFIG = {
 
 // Production configuration (update with your deployed backend URL)
 const PROD_CONFIG = {
-  API_BASE_URL: 'https://your-backend-name.onrender.com', // UPDATE THIS
+  API_BASE_URL: 'https://vardaan-website-node.onrender.com', // UPDATE THIS
   S3_BASE_URL: 'https://aws-microservice.onrender.com'
 };
 

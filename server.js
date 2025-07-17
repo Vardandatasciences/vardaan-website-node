@@ -40,9 +40,9 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Serve static files
-app.use('/static', express.static(path.join(__dirname, '../../build/static')));
-app.use('/assets', express.static(path.join(__dirname, '../../build/assets')));
+// Serve static files (commented out for backend-only deployment)
+// app.use('/static', express.static(path.join(__dirname, '../../build/static')));
+// app.use('/assets', express.static(path.join(__dirname, '../../build/assets')));
 
 // Database configuration
 const DB_CONFIG = {
@@ -191,6 +191,8 @@ app.get('/', (req, res) => {
 // Health check endpoint
 app.get('/api/health', async (req, res) => {
     let dbStatus = 'disconnected';
+    let s3Status = 'disconnected';
+    
     try {
         if (dbPool) {
             await dbPool.execute('SELECT 1');
@@ -199,12 +201,23 @@ app.get('/api/health', async (req, res) => {
     } catch (error) {
         console.error('Database health check failed:', error);
     }
+    
+    try {
+        if (s3Client) {
+            const testResult = await s3Client.testConnection();
+            s3Status = testResult.overall_success ? 'connected' : 'failed';
+        }
+    } catch (error) {
+        console.error('S3 health check failed:', error);
+    }
 
     res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
+        port: PORT,
         database: dbStatus,
-        media_database: dbStatus
+        s3_service: s3Status,
+        environment: process.env.NODE_ENV || 'development'
     });
 });
 
@@ -762,7 +775,7 @@ app.get('/api/media/debug', async (req, res) => {
     }
 });
 
-// Serve React app for all other routes
+// API-only routes (for backend deployment)
 app.get('*', (req, res) => {
     // If it's an API route that doesn't exist, return 404
     if (req.path.startsWith('/api/')) {
@@ -772,15 +785,23 @@ app.get('*', (req, res) => {
         });
     }
     
-    // For all other routes, serve the React app
-    const buildPath = path.join(__dirname, '../../build');
-    if (fs.existsSync(path.join(buildPath, 'index.html'))) {
-        res.sendFile(path.join(buildPath, 'index.html'));
-    } else {
-        res.status(404).json({ 
-            error: 'React app not found. Please run npm run build first.' 
-        });
-    }
+    // For all other routes, return API info
+    res.json({
+        message: 'Vardaan DS API Server',
+        status: 'running',
+        note: 'This is a backend API server. Frontend should be deployed separately.',
+        available_endpoints: [
+            '/api/contact',
+            '/api/health',
+            '/api/management-team',
+            '/api/media',
+            '/api/job-listings',
+            '/api/lapsec-pricing',
+            '/api/product-pricing',
+            '/api/subscribe-email',
+            '/api/get-currency'
+        ]
+    });
 });
 
 // Error handlers
@@ -794,10 +815,10 @@ app.use((error, req, res, next) => {
 
 // Start server
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`✅ Backend integrated with frontend build process`);
-    console.log(`📁 Serving static files from build directory`);
-    console.log(`🌐 API endpoints available at http://localhost:${PORT}/api/*`);
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`✅ Backend API server ready`);
+    console.log(`🌐 API endpoints available at /api/*`);
+    console.log(`📊 Health check: /api/health`);
 });
 
 module.exports = app; 
